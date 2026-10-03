@@ -1,0 +1,9 @@
+Historical conversion results (pre-assumption update).
+PASS: 7 verification tests; 35 shared-input JavaScript/Python evaluations.
+Original assumptions: generation, actions, costs, resources, energy and benefits match within 1e-7 absolute / 1e-10 relative tolerance.
+Required demo (same JavaScript-exported hourly input data):
+noIntervention: original 0.000000 extra MWh, $0.00 net; Python 0.000000 extra MWh, $0.00 net; actions []; spend $0.
+gapPlan: original 44.113961 extra MWh, $-3926.89 net; Python 44.113961 extra MWh, $-3926.89 net; actions ['B-snow']; spend $9000.
+optimizedPlan: original 748.476664 extra MWh, $54074.82 net; Python 747.752698 extra MWh, $53991.56 net; actions ['D-inverter']; spend $32000.
+Difference: explicit inverter repair downtime; net energy includes lost residual output during hours 8-11.
+Additional regression fixes: a zero-MW grid cap stays zero; zero-effectiveness inspection cannot restore an ambiguous gap.

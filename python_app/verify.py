@@ -1,153 +1,213 @@
-"""Shared-data parity checks plus independent tests of corrected behavior."""
+"""Current Python correctness tests; no historical fixtures or JavaScript needed."""
 
 from copy import deepcopy
-import json
-import math
-from pathlib import Path
+from itertools import combinations
 import unittest
 
-from model import (PLANT, DEFAULT_CONSTRAINTS, generate_scenario, evaluate,
-                   healthy_power, simulate_plan, feasible, natural_snow_factor, diagnose)
+from model import (PLANT, SCENARIOS, ACTION_DEFS, DEFAULT_CONSTRAINTS, generate_scenario,
+                   evaluate, simulate_plan, diagnose, natural_snow_factor)
 
-ROOT = Path(__file__).resolve().parent
-REFERENCE = json.loads((ROOT / "reference.json").read_text())
+
+def flat_dataset(hours=48, conditions=None, clearance=24, cap=None):
+    """Independent fixture: healthy MW equals AC capacity, without weather variation."""
+    conditions = conditions or {}
+    plant = deepcopy(PLANT)
+    observed = []
+    for section in plant["sections"]:
+        kind = conditions.get(section["id"], "healthy")
+        factor = {"inverter": .05, "snow": .08, "soiling": .86, "degradation": .75}.get(kind, 1)
+        observed.append({**section, "expectedMw": section["acMw"], "actualMw": section["acMw"] * factor,
+                         "inverterAlarm": kind == "inverter", "snowObserved": kind == "snow",
+                         "inspectionEvidence": kind if kind in ("soiling", "degradation") else None,
+                         "curtailmentFlag": False})
+    rows = []
+    for hour in range(hours):
+        sections = []
+        for section in plant["sections"]:
+            kind = conditions.get(section["id"], "healthy")
+            snow_factor = 1 if clearance == 0 else min(1, .08 + .92 * hour / clearance)
+            factor = {"inverter": .05, "snow": snow_factor, "soiling": .86, "degradation": .75}.get(kind, 1)
+            sections.append({**section, "expectedMw": section["acMw"],
+                             "actualBeforeCurtailmentMw": section["acMw"] * factor})
+        rows.append(dict(hour=hour, absoluteHour=13 + hour, curtailmentCapMw=cap, sections=sections))
+    return dict(plant=plant, hours=rows,
+                observations=dict(plant=deepcopy(plant), decisionHour=13,
+                                  hours=[dict(absoluteHour=12, sunlightIndex=1, moduleTempC=25, sections=observed)]))
 
 
 class Verification(unittest.TestCase):
-    def close(self, actual, expected):
-        self.assertTrue(math.isclose(actual, expected, rel_tol=1e-10, abs_tol=1e-7), (actual, expected))
-
-    def test_shared_hourly_inputs_and_35_reference_evaluations(self):
-        for case in REFERENCE["cases"]:
-            dataset = case["dataset"]
+    def test_constant_existing_degradation(self):
+        for percent in (0, 6, 25, 100):
+            dataset = generate_scenario("module-degradation", degradation_loss_pct=percent)
             for row in dataset["hours"]:
-                raw = [healthy_power(s["acMw"], row["sunlightIndex"], row["moduleTempC"]) for s in row["sections"]]
-                scale = min(1, dataset["plant"]["acLimitMw"] / sum(raw)) if sum(raw) else 1
-                for power, section in zip(raw, row["sections"]):
-                    self.close(power * scale, section["expectedMw"])
-            for expected in case["results"]:
-                # Use the original zero-outage assumptions for parity only.
-                result = evaluate(dataset, expected["constraints"], expected["paymentRate"], expected["candidates"])
-                for actual_diag, expected_diag in zip(result["diagnostics"], expected["diagnostics"]):
-                    self.assertEqual(actual_diag["cause"], expected_diag["cause"])
-                    self.assertEqual(actual_diag["actionType"], expected_diag["actionType"])
-                    for key in ("expectedMwh", "actualMwh", "gapMwh", "currentGapMw"):
-                        self.close(actual_diag[key], expected_diag[key])
-                for name in ("noIntervention", "gapPlan", "optimizedPlan"):
-                    actual, original = result[name], expected[name]
-                    self.assertEqual([a["id"] for a in actual["actions"]], [a["id"] for a in original["actions"]])
-                    for key in ("baselineMwh", "planMwh", "recoveredMwh", "spend", "crewHours", "inverterKits", "revenue", "netBenefit", "excludedCurtailmentMwh"):
-                        self.close(actual[key], original[key])
+                section = row["sections"][2]
+                self.assertAlmostEqual(section["actualBeforeCurtailmentMw"], section["expectedMw"] * (1 - percent / 100))
+        independent = evaluate(flat_dataset(24, {"C": "degradation"}))
+        self.assertEqual(independent["noIntervention"]["baselineMwh"], (51 + 9 * .75) * 24)
+        for value in (-1, 101, float("nan")):
+            with self.assertRaises(ValueError):
+                generate_scenario(degradation_loss_pct=value)
 
-    def test_reproducible_generator(self):
-        for case in REFERENCE["cases"]:
-            dataset = case["dataset"]
-            generated = generate_scenario(dataset["scenario"]["id"])
-            self.assertEqual(generated, generate_scenario(dataset["scenario"]["id"]))
-            for actual, expected in zip(generated["hours"], dataset["hours"]):
-                for key in ("sunlightIndex", "moduleTempC", "expectedMw", "actualMw"):
-                    self.close(actual[key], expected[key])
-                for a, b in zip(actual["sections"], expected["sections"]):
-                    for key in ("expectedMw", "actualMw", "actualBeforeCurtailmentMw"):
-                        self.close(a[key], b[key])
+    def test_inspection_zero_recovery(self):
+        for kind, section_id in (("degradation", "C"), ("ambiguous", "D")):
+            dataset = flat_dataset(24, {section_id: "degradation" if kind == "degradation" else "inverter"})
+            if kind == "ambiguous":
+                dataset["observations"]["hours"][0]["sections"][3]["inverterAlarm"] = False
+            result = evaluate(dataset, dict(budget=100000, crewHours=100, inverterSpares=2), 10000)
+            self.assertEqual(result["candidates"][0]["actionType"], kind)
+            self.assertEqual(result["candidates"][0]["effectiveness"], 0)
+            plan = simulate_plan(dataset, result["candidates"], 10000)
+            self.assertEqual(plan["recoveredMwh"], 0)
+            self.assertEqual(plan["netBenefit"], -ACTION_DEFS[kind]["cost"])
+            self.assertEqual(result["optimizedPlan"]["actions"], [])
 
-    def test_constraints_and_curtailment(self):
-        for case in REFERENCE["cases"]:
-            for expected in case["results"]:
-                result = evaluate(case["dataset"], expected["constraints"])
-                for key in ("gapPlan", "optimizedPlan"):
-                    plan = result[key]
-                    self.assertTrue(feasible(plan["actions"], expected["constraints"]))
-                    self.close(plan["recoveredMwh"], plan["planMwh"] - plan["baselineMwh"])
-                if not expected["constraints"]["inverterSpares"]:
-                    self.assertFalse(any(a["spareParts"]["inverterKit"] for a in result["optimizedPlan"]["actions"]))
-                if case["dataset"]["scenario"]["id"] == "grid-curtailment":
-                    self.assertEqual(result["candidates"], [])
-                    self.assertEqual(result["optimizedPlan"]["recoveredMwh"], 0)
+    def test_editable_snow_curve_and_credit(self):
+        for h, expected in ((0, .08), (2, .54), (4, 1), (10, 1)):
+            self.assertAlmostEqual(natural_snow_factor(h, 4), expected)
+        self.assertEqual(natural_snow_factor(0, 0), 1)
+        self.assertAlmostEqual(natural_snow_factor(336, 672), .54)
+        dataset = flat_dataset(6, {"B": "snow"}, clearance=4)
+        action = evaluate(dataset)["candidates"][0]
+        action["delayHours"] = 1
+        plan = simulate_plan(dataset, [action], 115)
+        # Hours 1,2,3: 92% after removal vs 31%,54%,77% naturally.
+        self.assertAlmostEqual(plan["recoveredMwh"], 14 * (.61 + .38 + .15))
+        self.assertTrue(all(r["incrementalMwh"] == 0 for r in plan["hourly"][4:]))
+        immediate = evaluate(flat_dataset(24, {"B": "snow"}, clearance=0))
+        self.assertEqual(simulate_plan(immediate["dataset"], immediate["candidates"], 115)["recoveredMwh"], 0)
+        for clearance in (0, 3, 24, 672):
+            result = evaluate(generate_scenario("snow-coverage", snow_clearance_hours=clearance))
+            plan = simulate_plan(result["dataset"], result["candidates"], 115)
+            self.assertTrue(all(abs(r["incrementalMwh"]) < 1e-8 for r in plan["hourly"] if r["hour"] >= clearance))
+            if clearance == 672:
+                # At forecast hour 335 (daylight), half the shedding horizon remains.
+                section = result["dataset"]["hours"][335]["sections"][1]
+                self.assertGreater(section["expectedMw"], 0)
+                self.assertAlmostEqual(section["actualBeforeCurtailmentMw"] / section["expectedMw"], .08 + .92 * 335 / 672)
+                self.assertGreater(plan["recoveredMwh"], 0)
+        with self.assertRaises(ValueError):
+            generate_scenario(snow_clearance_hours=-1)
 
-    def test_demo_downtime_and_energy_units(self):
-        dataset = REFERENCE["cases"][0]["dataset"]
-        result = evaluate(dataset)
-        snow, inverter = result["diagnostics"][1], result["diagnostics"][3]
-        self.assertGreater(snow["currentGapMw"], inverter["currentGapMw"])
-        self.assertEqual([a["id"] for a in result["gapPlan"]["actions"]], ["B-snow"])
-        self.assertEqual([a["id"] for a in result["optimizedPlan"]["actions"]], ["D-inverter"])
-        self.assertGreater(result["optimizedPlan"]["netBenefit"], result["gapPlan"]["netBenefit"])
-        original = REFERENCE["cases"][0]["results"][0]["optimizedPlan"]
-        outage_loss = sum(next(s for s in row["sections"] if s["id"] == "D")["actualMw"] for row in dataset["hours"][8:12])
-        corrected = result["optimizedPlan"]
-        self.close(original["recoveredMwh"] - corrected["recoveredMwh"], outage_loss)
-        self.close(original["netBenefit"] - corrected["netBenefit"], outage_loss * 115)
-        self.assertTrue(all(r["incrementalMwh"] < 0 for r in corrected["hourly"][8:12]))
-        self.close(sum(r["actualMw"] for r in dataset["hours"]), corrected["baselineMwh"])
-        self.close(sum(r["incrementalMwh"] for r in corrected["hourly"]), corrected["recoveredMwh"])
+    def test_no_future_information_leakage(self):
+        original = generate_scenario("required-demo")
+        expected = diagnose(original["observations"])
+        poisoned = deepcopy(original)
+        poisoned["scenario"] = {"issues": {"A": "degradation"}, "name": "Hidden fault bait"}
+        for row in poisoned["hours"]:
+            row["sections"] = []
+        self.assertEqual(diagnose(poisoned["observations"]), expected)
+        for clearance in (0, 672):
+            changed = generate_scenario("required-demo", weather="cloudy", snow_clearance_hours=clearance)
+            self.assertEqual(changed["observations"], original["observations"])
+            self.assertEqual(diagnose(changed["observations"]), expected)
+        observation_view = deepcopy(original["observations"])
+        future = deepcopy(observation_view["hours"][-1])
+        future["absoluteHour"] = observation_view["decisionHour"]
+        future["sections"][0].update(inverterAlarm=True, inspectionEvidence="degradation")
+        observation_view["hours"].append(future)
+        self.assertEqual(diagnose(observation_view), expected)
+        for row in original["observations"]["hours"]:
+            self.assertTrue(all("issue" not in s for s in row["sections"]))
 
-    def test_natural_shedding(self):
-        self.assertEqual([natural_snow_factor(h) for h in (17, 18, 29, 30, 41, 42)], [.08, .35, .35, .78, .78, 1])
-        result = evaluate(generate_scenario("snow-coverage"))
+    def test_diagnosis_requires_historical_evidence(self):
+        dataset = flat_dataset(24, {"D": "inverter", "E": "soiling", "C": "degradation"})
+        for section in dataset["observations"]["hours"][0]["sections"]:
+            section["inverterAlarm"] = False
+            section["inspectionEvidence"] = None
+            section["issue"] = "soiling"  # Latent labels cannot establish diagnosis.
+        diagnostics = diagnose(dataset["observations"])
+        for index in (2, 3, 4):
+            self.assertEqual(diagnostics[index]["actionType"], "ambiguous")
+        dataset["observations"]["hours"][0]["sections"][4]["inspectionEvidence"] = "soiling"
+        self.assertEqual(diagnose(dataset["observations"])[4]["actionType"], "soiling")
+
+    def test_repair_downtime_and_energy_units(self):
+        result = evaluate(flat_dataset(16, {"D": "inverter"}))
         plan = simulate_plan(result["dataset"], result["candidates"], 115)
-        self.assertGreater(plan["recoveredMwh"], 0)
-        self.assertTrue(all(abs(r["incrementalMwh"]) < 1e-9 for r in plan["hourly"][42:]))
+        baseline_power = 48 + 12 * .05
+        expected_gain = 4 * 12 * .95 * .97 - 4 * 12 * .05
+        self.assertAlmostEqual(plan["baselineMwh"], baseline_power * 16)
+        self.assertAlmostEqual(plan["recoveredMwh"], expected_gain)
+        self.assertAlmostEqual(plan["netBenefit"], expected_gain * 115 - 32000)
+        self.assertTrue(all(abs(r["incrementalMwh"] + .6) < 1e-8 for r in plan["hourly"][8:12]))
+        self.assertAlmostEqual(sum(r["incrementalMwh"] for r in plan["hourly"]), plan["planMwh"] - plan["baselineMwh"])
 
-    def test_caps_and_no_double_counting(self):
+    def test_resources_and_unchanged_gap_first(self):
         dataset = generate_scenario()
-        # Deterministic interacting actions behind one export cap.
-        for row in dataset["hours"]:
-            row["curtailmentCapMw"] = 5
-        result = evaluate(dataset, dict(budget=100000, crewHours=100, inverterSpares=2))
-        actions = result["candidates"]
+        for limits in (dict(budget=0, crewHours=22, inverterSpares=1),
+                       dict(budget=45000, crewHours=0, inverterSpares=1),
+                       dict(budget=45000, crewHours=22, inverterSpares=0), DEFAULT_CONSTRAINTS):
+            result = evaluate(dataset, limits)
+            for name in ("optimizedPlan", "gapPlan"):
+                plan = result[name]
+                self.assertLessEqual(plan["spend"], limits["budget"])
+                self.assertLessEqual(plan["crewHours"], limits["crewHours"])
+                self.assertLessEqual(plan["inverterKits"], limits["inverterSpares"])
+        self.assertEqual(evaluate(dataset, payment_rate=0)["optimizedPlan"]["actions"], [])
+        self.assertEqual([a["id"] for a in evaluate(dataset)["gapPlan"]["actions"]], ["B-snow"])
+        self.assertEqual([a["id"] for a in evaluate(dataset)["optimizedPlan"]["actions"]], ["D-inverter"])
+
+    def test_optimizer_against_independent_all_subsets_oracle(self):
+        dataset = flat_dataset(48, {"B": "snow", "D": "inverter", "E": "soiling", "C": "degradation"}, cap=50)
+        for budget, crew, spares, rate in ((45000, 22, 1, 115), (100000, 100, 3, 115),
+                                          (100000, 100, 0, 115), (100000, 100, 3, 0)):
+            result = evaluate(dataset, dict(budget=budget, crewHours=crew, inverterSpares=spares), rate)
+            candidates = result["candidates"]
+            scores = []
+            for size in range(len(candidates) + 1):
+                for subset in combinations(candidates, size):
+                    cost = sum(a["cost"] for a in subset)
+                    hours = sum(a["crewHours"] for a in subset)
+                    kits = sum(a["spareParts"]["inverterKit"] for a in subset)
+                    if cost > budget or hours > crew or kits > spares:
+                        continue
+                    ids = {a["sectionId"] for a in subset}
+                    recovered = 0
+                    for h in range(48):
+                        snow = min(1, .08 + .92 * h / 24)
+                        inverter = 0 if "D" in ids and 8 <= h < 12 else (.05 + .95 * .97 if "D" in ids and h >= 12 else .05)
+                        soil = .86 + .14 * .85 if "E" in ids and h >= 24 else .86
+                        removed_snow = max(snow, .92) if "B" in ids and h >= 6 else snow
+                        # Healthy A+F=18 MW; C=9 MW at 75%, unchanged by inspection.
+                        base = 18 + 9 * .75 + 14 * snow + 12 * .05 + 7 * .86
+                        planned = 18 + 9 * .75 + 14 * removed_snow + 12 * inverter + 7 * soil
+                        recovered += min(planned, 50) - min(base, 50)
+                    scores.append((recovered * rate - cost, recovered))
+            best = max(scores)
+            self.assertAlmostEqual(result["optimizedPlan"]["netBenefit"], best[0])
+            self.assertAlmostEqual(result["optimizedPlan"]["recoveredMwh"], best[1])
+
+    def test_export_caps_and_no_double_counting(self):
+        dataset = flat_dataset(48, {"B": "snow", "D": "inverter"}, cap=50)
+        actions = evaluate(dataset)["candidates"]
         joint = simulate_plan(dataset, actions, 115)
         singles = sum(simulate_plan(dataset, [a], 115)["recoveredMwh"] for a in actions)
         self.assertLess(joint["recoveredMwh"], singles)
-        self.assertTrue(all(r["planMw"] <= 5 for r in joint["hourly"]))
-        self.close(joint["recoveredMwh"], joint["planMwh"] - joint["baselineMwh"])
+        self.assertTrue(all(r["planMw"] <= 50 for r in joint["hourly"]))
+        self.assertAlmostEqual(joint["recoveredMwh"], joint["planMwh"] - joint["baselineMwh"])
         with self.assertRaises(ValueError):
             simulate_plan(dataset, [actions[0], actions[0]], 115)
         for row in dataset["hours"]:
             row["curtailmentCapMw"] = 0
-        zero = simulate_plan(dataset, actions, 115)
-        self.assertEqual(zero["planMwh"], 0)
-        self.assertEqual(zero["recoveredMwh"], 0)
+        self.assertEqual(simulate_plan(dataset, actions, 115)["recoveredMwh"], 0)
+        curtailed = evaluate(generate_scenario("grid-curtailment"))
+        self.assertEqual(curtailed["candidates"], [])
+        self.assertEqual(curtailed["optimizedPlan"]["recoveredMwh"], 0)
 
-    def test_edited_capacities_weather_and_ambiguous_evidence(self):
+    def test_reproducibility_and_ac_limits(self):
+        for scenario in SCENARIOS:
+            self.assertEqual(generate_scenario(scenario["id"]), generate_scenario(scenario["id"]))
         plant = deepcopy(PLANT)
         for section in plant["sections"]:
             section["acMw"] *= 3
         for weather in ("sunny", "cloudy", "mixed-sunny"):
             dataset = generate_scenario(plant=plant, weather=weather)
+            self.assertEqual(len(dataset["hours"]), 336)
+            self.assertEqual(len(dataset["observations"]["hours"]), 13)
             for row in dataset["hours"]:
                 self.assertLessEqual(row["expectedMw"], 60 + 1e-9)
                 self.assertTrue(all(s["expectedMw"] <= s["acMw"] for s in row["sections"]))
-        dataset = generate_scenario("inverter-fault")
-        dataset["scenario"]["issues"] = {}
-        for row in dataset["hours"]:
-            for section in row["sections"]:
-                section["inverterAlarm"] = False
-        self.assertEqual(diagnose(dataset)[3]["actionType"], "ambiguous")
-        ambiguous = evaluate(dataset)
-        inspection = simulate_plan(dataset, ambiguous["candidates"], 115)
-        self.assertEqual(inspection["recoveredMwh"], 0)
-        self.assertEqual(ambiguous["optimizedPlan"]["actions"], [])
 
 
 if __name__ == "__main__":
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(Verification)
-    run = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not run.wasSuccessful():
-        raise SystemExit(1)
-    dataset = REFERENCE["cases"][0]["dataset"]
-    corrected = evaluate(dataset)
-    original = REFERENCE["cases"][0]["results"][0]
-    lines = ["PASS: 7 verification tests; 35 shared-input JavaScript/Python evaluations.",
-             "Original assumptions: generation, actions, costs, resources, energy and benefits match within 1e-7 absolute / 1e-10 relative tolerance.",
-             "Required demo (same JavaScript-exported hourly input data):"]
-    for name in ("noIntervention", "gapPlan", "optimizedPlan"):
-        old, new = original[name], corrected[name]
-        lines.append(f'{name}: original {old["recoveredMwh"]:.6f} extra MWh, ${old["netBenefit"]:.2f} net; '
-                     f'Python {new["recoveredMwh"]:.6f} extra MWh, ${new["netBenefit"]:.2f} net; '
-                     f'actions {[a["id"] for a in new["actions"]]}; spend ${new["spend"]:.0f}.')
-    lines.append("Difference: explicit inverter repair downtime; net energy includes lost residual output during hours 8-11.")
-    lines.append("Additional regression fixes: a zero-MW grid cap stays zero; zero-effectiveness inspection cannot restore an ambiguous gap.")
-    report = "\n".join(lines) + "\n"
-    (ROOT / "verification_results.txt").write_text(report)
-    print(report)
+    unittest.main(verbosity=2)

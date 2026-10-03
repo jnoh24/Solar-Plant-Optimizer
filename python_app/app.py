@@ -5,13 +5,13 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from model import PLANT, SCENARIOS, DEFAULT_CONSTRAINTS, generate_scenario, evaluate, simulate_plan
+from model import PLANT, SCENARIOS, generate_scenario, evaluate, simulate_plan
 
 st.set_page_config(page_title="Solar Asset Optimization", layout="wide")
 
 
 def reset_demo():
-    for key in ("scenario", "weather", "budget", "crew", "spares", "payment", "sections", "result", "inputs"):
+    for key in ("scenario", "weather", "budget", "crew", "spares", "payment", "degradation", "snow_clearance", "sections", "result", "inputs"):
         st.session_state.pop(key, None)
     st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
 
@@ -23,6 +23,7 @@ def reset_weather():
 st.title("Explainable Solar Asset Optimization")
 st.warning("Synthetic demonstration — not validated plant performance.")
 st.caption("Fictional Plant A | 60 MW AC limit | Six unequal array sections | 14-day horizon")
+st.caption("Maintenance action selection, not a dispatch schedule. Total crew-hours are constrained; parallel crew availability is not modeled.")
 st.caption("Portfolio context: approximately 325 MW AC across five Ontario plants. This fictional plant does not imply equal portfolio capacities.")
 
 with st.sidebar:
@@ -30,9 +31,15 @@ with st.sidebar:
     scenario_id = st.selectbox("Scenario", [s["id"] for s in SCENARIOS],
                                format_func=lambda value: next(s["name"] for s in SCENARIOS if s["id"] == value),
                                key="scenario", on_change=reset_weather)
-    weather = st.selectbox("Weather profile", ["Scenario default", "mixed-sunny", "sunny", "cloudy"], key="weather")
+    weather = st.selectbox("Forecast weather profile", ["Scenario default", "mixed-sunny", "sunny", "cloudy"], key="weather")
+    degradation = st.number_input("Existing degradation output loss (%)", min_value=0.0, max_value=100.0,
+                                  value=6.0, step=1.0, key="degradation")
+    st.caption("Constant loss in the degradation scenario. This is existing degradation, not annual aging.")
+    snow_clearance = st.number_input("Assumed natural snow clearance (hours after decision)",
+                                     min_value=0.0, value=24.0, step=1.0, key="snow_clearance")
+    st.caption("User assumption, not a weather prediction. Zero means immediate clearance; values above 336 extend beyond the forecast.")
     budget = st.number_input("Maintenance budget ($)", min_value=0, value=45000, step=1000, key="budget")
-    crew = st.number_input("Available crew-hours", min_value=0, value=22, step=1, key="crew")
+    crew = st.number_input("Total available crew-hours", min_value=0, value=22, step=1, key="crew")
     spares = st.number_input("Available inverter spare kits", min_value=0, value=1, step=1, key="spares")
     payment = st.number_input("Assumed payment ($/MWh)", min_value=0.0, value=115.0, step=1.0, key="payment")
     st.caption("Payment is an explicit assumption, not a verified PPA tariff. All dollar amounts use the same assumed currency.")
@@ -48,11 +55,16 @@ with st.expander("Section data", expanded=True):
 plant = deepcopy(PLANT)
 plant["sections"] = sections.to_dict("records")
 constraints = dict(budget=budget, crewHours=crew, inverterSpares=spares)
-inputs = dict(scenario=scenario_id, weather=weather, plant=plant, constraints=constraints, payment=payment)
+inputs = dict(scenario=scenario_id, weather=weather, plant=plant, constraints=constraints, payment=payment,
+              degradation=degradation, snow_clearance=snow_clearance)
+if "result" in st.session_state and "observations" not in st.session_state["result"]["dataset"]:
+    st.session_state.pop("result")
+    st.session_state.pop("inputs", None)
 run = st.button("Run optimization", type="primary")
 if run or "result" not in st.session_state:
     try:
-        dataset = generate_scenario(scenario_id, plant, None if weather == "Scenario default" else weather)
+        dataset = generate_scenario(scenario_id, plant, None if weather == "Scenario default" else weather,
+                                    degradation, snow_clearance)
         st.session_state["result"] = evaluate(dataset, constraints, payment)
         st.session_state["inputs"] = deepcopy(inputs)
     except (ValueError, TypeError, KeyError) as error:
@@ -68,6 +80,8 @@ optimized = result["optimizedPlan"]
 gap = result["gapPlan"]
 baseline = result["noIntervention"]
 st.subheader(dataset["scenario"]["name"])
+st.caption("Decision time: day 1, 13:00. Historical observations cover 00:00-13:00; the last interval is 12:00-13:00. "
+           "Benefits are valued over the following 336 hours only.")
 st.caption(f'Results use {dataset["scenario"]["weather"]} weather; budget ${limits["budget"]:,.0f}, '
            f'{limits["crewHours"]} crew-hours, {limits["inverterSpares"]} spare kits, '
            f'${result["paymentRate"]:,.2f}/MWh.')
@@ -78,13 +92,26 @@ cols[2].metric("Maintenance spending", f'${optimized["spend"]:,.0f}')
 cols[3].metric("Incremental net benefit", f'${optimized["netBenefit"]:,.0f}')
 st.caption(f'Optimized resources: {optimized["crewHours"]} crew-hours, {optimized["inverterKits"]} inverter kits.')
 
-st.subheader("Expected vs actual generation")
+st.subheader("Observed evidence before the decision")
+history = dataset["observations"]["hours"]
+observed = pd.DataFrame({"Hour of day 1": [r["absoluteHour"] for r in history],
+                         "Expected healthy": [r["expectedMw"] for r in history],
+                         "Observed actual": [r["actualMw"] for r in history]})
+st.line_chart(observed.set_index("Hour of day 1"), y_label="Power (MW)")
+st.caption(f'Historical weather profile: {dataset["assumptions"]["observedWeather"]}. '
+           'Only observed output, weather, alarms, snow observations, and recorded inspection evidence inform diagnosis.')
+
+st.subheader("Forecast generation after the decision")
+st.caption(f'Forecast assumptions: {dataset["assumptions"]["forecastWeather"]} weather; '
+           f'{dataset["assumptions"]["degradationLossPct"]:g}% constant existing degradation loss; '
+           f'natural snow clearance {dataset["assumptions"]["snowClearanceHours"]:g} hours after decision. '
+           'These are synthetic assumptions, not future observations or validated predictions.')
 generation = pd.DataFrame({"Hour": [r["hour"] for r in dataset["hours"]],
                            "Expected healthy": [r["expectedMw"] for r in dataset["hours"]],
-                           "Actual baseline": [r["actualMw"] for r in dataset["hours"]]})
+                           "Forecast baseline": [r["actualMw"] for r in dataset["hours"]]})
 lines = generation.melt("Hour", var_name="Generation", value_name="Power (MW)")
 st.altair_chart(alt.Chart(lines).mark_line().encode(
-    x=alt.X("Hour:Q", title="Hour of 14-day horizon"),
+    x=alt.X("Hour:Q", title="Hours after decision (14-day forecast)"),
     y=alt.Y("Power (MW):Q", scale=alt.Scale(domain=[0, dataset["plant"]["acLimitMw"]])),
     color="Generation:N", tooltip=["Hour:Q", "Generation:N", alt.Tooltip("Power (MW):Q", format=".2f")]
 ).properties(height=300), width="stretch")
@@ -111,8 +138,8 @@ with left:
     for diagnostic in result["diagnostics"]:
         st.markdown(f'**{diagnostic["sectionId"]} | {diagnostic["sectionName"]} ({diagnostic["acMw"]:g} MW AC)**')
         st.write(f'{diagnostic["cause"]} | {diagnostic["confidence"]} confidence')
-        st.caption(f'Current gap (day 1, noon): {diagnostic["currentGapMw"]:.2f} MW | '
-                   f'14-day gap: {diagnostic["gapMwh"]:.1f} MWh')
+        st.caption(f'Last observed gap (12:00-13:00): {diagnostic["currentGapMw"]:.2f} MW | '
+                   f'Historical observed gap: {diagnostic["gapMwh"]:.1f} MWh')
         for evidence in diagnostic["evidence"]:
             st.write(evidence)
         st.divider()
@@ -144,6 +171,8 @@ with right:
                 reasons.append("Required inverter spare kit is unavailable.")
             if standalone["netBenefit"] <= 0:
                 reasons.append("Assumed recovered revenue does not exceed action cost.")
+            if action["actionType"] in ("degradation", "ambiguous"):
+                reasons.append("Inspection is available for information gathering; its information value is not quantified.")
             st.write(" ".join(reasons) or "Other actions create greater total value within the shared resource limits.")
         if action["id"] in gap_ids and not chosen:
             st.write("Largest-gap-first selects this action based on its current MW gap.")
@@ -161,15 +190,24 @@ with st.expander("Assumptions and calculations", expanded=True):
     st.write("Objective: maximize (plan MWh - no-intervention MWh) x assumed payment per MWh - maintenance costs. "
              "All subsets of indicated actions are enumerated, including doing nothing. Spending, total crew-hours, "
              "and inverter kits must fit the same limits for both intervention strategies. At most one action is chosen per section. "
-             "Actions run in parallel; crew-hours are a total resource limit, not a shift schedule.")
+             "This is maintenance action selection, not a dispatch schedule. Completion delays are assumptions; "
+             "total crew-hours do not model parallel crew availability or detailed scheduling.")
     st.write("Before completion, baseline losses persist. Inverter repair additionally shuts the section down "
              "during hours 8-11 of its 12-hour delay; that lost output is subtracted from recovery. "
-             "Other actions retain the original zero-outage assumption. Snow output naturally rises from 8% "
-             "to 35% at hour 18, 78% at hour 30, and 100% at hour 42 (tomorrow evening). "
-             "Removal raises the snow factor to at least 92%, never above naturally shed output once clear.")
+             "Hours are measured after the decision; other actions assume zero outage. Natural snow output "
+             "factor = 0.08 + 0.92 x min(hours after decision / assumed clearance hours, 1). "
+             "Zero clearance hours means fully clear immediately. Clearance beyond 336 hours leaves snow at the end. "
+             "The same curve applies to every plan; removal raises the factor to at least 92% after completion "
+             "and earns credit only before natural clearance. Clearance time is a user assumption, not predicted from weather.")
+    st.write("Existing degradation is a constant user-entered percentage loss across the forecast, not an hourly "
+             "decline or annual aging rate. Inspection has zero immediate energy recovery. Its information value "
+             "is not quantified; the energy-only financial objective will not recommend a paid inspection. "
+             "No replacement or lifecycle modeling is included.")
     st.write("The whole plant is simulated with each plan before applying grid caps; individual action benefits "
              "are never added together. Curtailment alone has no maintenance recovery. Grid caps may prevent "
              "otherwise recoverable energy from being exported. Fault diagnoses require alarms, snow observations, "
-             "or synthetic inspection tags; unsupported output gaps are marked ambiguous.")
+             "or explicit historical inspection evidence; unsupported output gaps are marked ambiguous. "
+             "Diagnosis sees only records before day 1 at 13:00. Forecast weather and condition assumptions "
+             "are used only to value future actions, never to establish a historical diagnosis.")
     st.caption(f'Optimized potential recovery excluded by grid caps: {optimized["excludedCurtailmentMwh"]:.1f} MWh; '
                f'largest-gap-first: {gap["excludedCurtailmentMwh"]:.1f} MWh.')

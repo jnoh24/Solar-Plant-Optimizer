@@ -1,14 +1,59 @@
 """Exercise Streamlit widgets and reruns without a browser."""
 
 from pathlib import Path
+from copy import deepcopy
 import json
 import unittest
+from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 from streamlit.proto.WidgetStates_pb2 import WidgetState
 from model import SCENARIOS
 
 
 class InterfaceVerification(unittest.TestCase):
+    def test_dashboard_without_legacy_data(self):
+        original_open = Path.open
+
+        def without_reference(path, *args, **kwargs):
+            if path.name in ("reference.json", "export_reference.js", "simulator.js"):
+                raise AssertionError("Dashboard attempted to read a legacy dependency")
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", without_reference):
+            app = AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=20).run()
+        self.assertEqual(len(app.exception), 0)
+
+    def test_new_assumptions_and_observed_forecast_separation(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=20).run()
+        observations = app.session_state["result"]["dataset"]["observations"]
+        app.number_input(key="snow_clearance").set_value(0.0).run()
+        next(button for button in app.button if button.label == "Run optimization").click().run()
+        result = app.session_state["result"]
+        self.assertEqual(result["dataset"]["observations"], observations)
+        self.assertEqual(result["gapPlan"]["recoveredMwh"], 0)
+        app.number_input(key="snow_clearance").set_value(672.0).run()
+        next(button for button in app.button if button.label == "Run optimization").click().run()
+        self.assertEqual(app.session_state["result"]["dataset"]["assumptions"]["snowClearanceHours"], 672)
+        app.selectbox(key="scenario").set_value("module-degradation").run()
+        app.number_input(key="degradation").set_value(25.0).run()
+        next(button for button in app.button if button.label == "Run optimization").click().run()
+        result = app.session_state["result"]
+        self.assertEqual(result["dataset"]["assumptions"]["degradationLossPct"], 25)
+        self.assertEqual(result["candidates"][0]["effectiveness"], 0)
+        self.assertEqual(result["optimizedPlan"]["actions"], [])
+        self.assertEqual(result["gapPlan"]["recoveredMwh"], 0)
+        next(button for button in app.button if button.label == "Reset demo").click().run()
+        self.assertEqual(app.number_input(key="degradation").value, 6)
+        self.assertEqual(app.number_input(key="snow_clearance").value, 24)
+        self.assertEqual(len(app.exception), 0)
+        # A session opened before the update is safely recalculated on refresh.
+        previous_shape = deepcopy(app.session_state["result"])
+        previous_shape["dataset"].pop("observations")
+        app.session_state["result"] = previous_shape
+        app.run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("observations", app.session_state["result"]["dataset"])
+
     def test_run_edit_reset_and_scenarios(self):
         app = AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=20).run()
         self.assertEqual(len(app.exception), 0)
