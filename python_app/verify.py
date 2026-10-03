@@ -5,7 +5,8 @@ from itertools import combinations
 import unittest
 
 from model import (PLANT, SCENARIOS, ACTION_DEFS, DEFAULT_CONSTRAINTS, generate_scenario,
-                   evaluate, simulate_plan, diagnose, natural_snow_factor)
+                   evaluate, simulate_plan, diagnose, natural_snow_factor, profit_screened_gap_first,
+                   NET_BENEFIT_TOLERANCE, MULTI_FAULT_OPTIONS)
 
 
 def flat_dataset(hours=48, conditions=None, clearance=24, cap=None):
@@ -132,7 +133,7 @@ class Verification(unittest.TestCase):
         self.assertTrue(all(abs(r["incrementalMwh"] + .6) < 1e-8 for r in plan["hourly"][8:12]))
         self.assertAlmostEqual(sum(r["incrementalMwh"] for r in plan["hourly"]), plan["planMwh"] - plan["baselineMwh"])
 
-    def test_resources_and_unchanged_gap_first(self):
+    def test_resources_and_profit_screened_gap_first(self):
         dataset = generate_scenario()
         for limits in (dict(budget=0, crewHours=22, inverterSpares=1),
                        dict(budget=45000, crewHours=0, inverterSpares=1),
@@ -144,8 +145,121 @@ class Verification(unittest.TestCase):
                 self.assertLessEqual(plan["crewHours"], limits["crewHours"])
                 self.assertLessEqual(plan["inverterKits"], limits["inverterSpares"])
         self.assertEqual(evaluate(dataset, payment_rate=0)["optimizedPlan"]["actions"], [])
-        self.assertEqual([a["id"] for a in evaluate(dataset)["gapPlan"]["actions"]], ["B-snow"])
+        self.assertEqual([a["id"] for a in evaluate(dataset)["gapPlan"]["actions"]], ["D-inverter"])
         self.assertEqual([a["id"] for a in evaluate(dataset)["optimizedPlan"]["actions"]], ["D-inverter"])
+
+    def test_greedy_marginal_shared_export_cap(self):
+        dataset = flat_dataset(48, {"B": "inverter", "D": "inverter"}, cap=45)
+        limits = dict(budget=100000, crewHours=100, inverterSpares=3)
+        result = evaluate(dataset, limits)
+        candidates = {a["sectionId"]: a for a in result["candidates"]}
+        standalone = simulate_plan(dataset, [candidates["D"]], 115)
+        # Baseline 35.3 MW; cap 45 gives 9.7 MW headroom after completion.
+        # D alone: 36 hours * 9.7 MWh less 4 hours * 0.6 MWh outage loss.
+        self.assertAlmostEqual(standalone["netBenefit"], (36 * 9.7 - 4 * .6) * 115 - 32000)
+        self.assertGreater(standalone["netBenefit"], 0)
+        greedy = result["gapPlan"]
+        self.assertEqual([a["id"] for a in greedy["actions"]], ["B-inverter"])
+        decision = greedy["decisions"][1]
+        self.assertFalse(decision["accepted"])
+        # B already fills the cap; D adds only its outage loss and repair cost.
+        self.assertAlmostEqual(decision["marginalNetBenefit"], -4 * .6 * 115 - 32000)
+        self.assertGreater(result["optimizedPlan"]["netBenefit"], greedy["netBenefit"])
+
+    def test_greedy_ties_tolerance_duplicates_and_continuation(self):
+        dataset = flat_dataset(48, {"B": "inverter", "D": "inverter"})
+        limits = dict(budget=100000, crewHours=100, inverterSpares=3)
+        candidates = evaluate(dataset, limits)["candidates"]
+        for action in candidates:
+            action["currentGapMw"] = 1
+        forward = profit_screened_gap_first(dataset, candidates, limits, 115)
+        reverse = profit_screened_gap_first(dataset, list(reversed(candidates)), limits, 115)
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward["decisions"][0]["sectionId"], "B")
+        alternate = dict(candidates[0], id="B-inverter-alternate")
+        repeated = profit_screened_gap_first(dataset, candidates + [alternate], limits, 115)
+        self.assertEqual(len({a["sectionId"] for a in repeated["actions"]}), len(repeated["actions"]))
+        self.assertTrue(any("already selected" in " ".join(d["reasons"]) for d in repeated["decisions"]))
+        inspection_data = flat_dataset(24, {"C": "degradation"})
+        inspection = evaluate(inspection_data)["candidates"][0]
+        inspection["cost"] = 0
+        zero = profit_screened_gap_first(inspection_data, [inspection], limits, 115)
+        self.assertFalse(zero["decisions"][0]["accepted"])
+        self.assertEqual(zero["decisions"][0]["marginalNetBenefit"], 0)
+        # Exact analytical inverter gain at 16 hours is 41.832 MWh.
+        short_data = flat_dataset(16, {"D": "inverter"})
+        action = evaluate(short_data)["candidates"][0]
+        action["cost"] = 41.832 * 115 - NET_BENEFIT_TOLERANCE / 2
+        tiny = profit_screened_gap_first(short_data, [action], limits, 115)
+        self.assertFalse(tiny["decisions"][0]["accepted"])
+        action["cost"] = 41.832 * 115 - NET_BENEFIT_TOLERANCE * 2
+        positive = profit_screened_gap_first(short_data, [action], limits, 115)
+        self.assertTrue(positive["decisions"][0]["accepted"])
+        demo = evaluate(generate_scenario())
+        self.assertFalse(demo["gapPlan"]["decisions"][0]["accepted"])
+        self.assertTrue(demo["gapPlan"]["decisions"][1]["accepted"])
+
+    def test_multi_fault_demo_independent_energy_and_subset_values(self):
+        options = MULTI_FAULT_OPTIONS
+        dataset = generate_scenario("multi-fault-demo", snow_clearance_hours=options["snowClearanceHours"])
+        limits = {key: options[key] for key in ("budget", "crewHours", "inverterSpares")}
+        result = evaluate(dataset, limits, options["paymentRate"])
+        energy = dict(A=0.0, B=0.0, D=0.0)
+        # Independently integrate the documented recovery/outage factors against
+        # supplied future healthy MW; do not call simulation or factor helpers.
+        for row in dataset["hours"]:
+            h = row["hour"]
+            healthy = {s["id"]: s["expectedMw"] for s in row["sections"]}
+            for section in ("A", "D"):
+                if h >= 12:
+                    energy[section] += healthy[section] * .95 * .97
+                elif 8 <= h < 12:
+                    energy[section] -= healthy[section] * .05
+            if 6 <= h < 96:
+                energy["B"] += healthy["B"] * max(0, .92 - (.08 + .92 * h / 96))
+        self.assertEqual([a["id"] for a in result["gapPlan"]["actions"]], ["B-snow", "D-inverter"])
+        self.assertEqual([a["id"] for a in result["optimizedPlan"]["actions"]], ["A-inverter", "D-inverter"])
+        self.assertAlmostEqual(result["gapPlan"]["recoveredMwh"], energy["B"] + energy["D"])
+        self.assertAlmostEqual(result["gapPlan"]["netBenefit"], (energy["B"] + energy["D"]) * 115 - 41000)
+        self.assertAlmostEqual(result["optimizedPlan"]["recoveredMwh"], energy["A"] + energy["D"])
+        self.assertAlmostEqual(result["optimizedPlan"]["netBenefit"], (energy["A"] + energy["D"]) * 115 - 64000)
+        self.assertAlmostEqual(result["gapPlan"]["netBenefit"], 57108.62941299107)
+        self.assertAlmostEqual(result["optimizedPlan"]["netBenefit"], 81134.28619752836)
+        scores = []
+        for size in range(4):
+            for subset in combinations("ABD", size):
+                spend = sum(9000 if s == "B" else 32000 for s in subset)
+                crew = sum(12 if s == "B" else 16 for s in subset)
+                kits = sum(s != "B" for s in subset)
+                if spend <= 64000 and crew <= 32 and kits <= 2:
+                    scores.append((sum(energy[s] for s in subset) * 115 - spend, subset))
+        self.assertEqual(max(scores)[1], ("A", "D"))
+        self.assertGreater(result["gapPlan"]["decisions"][0]["marginalNetBenefit"], NET_BENEFIT_TOLERANCE)
+        self.assertIsNone(result["gapPlan"]["decisions"][2]["marginalNetBenefit"])
+
+    def test_discretionary_strategies_satisfy_value_and_resource_invariants(self):
+        for scenario in SCENARIOS:
+            for clearance in (0, 24, 96, 672):
+                dataset = generate_scenario(scenario["id"], snow_clearance_hours=clearance)
+                for limits, rate in ((DEFAULT_CONSTRAINTS, 115),
+                                     (dict(budget=64000, crewHours=32, inverterSpares=2), 115),
+                                     (dict(budget=100000, crewHours=100, inverterSpares=0), 115),
+                                     (dict(budget=100000, crewHours=100, inverterSpares=3), 0),
+                                     (dict(budget=0, crewHours=0, inverterSpares=0), 115)):
+                    result = evaluate(dataset, limits, rate)
+                    greedy, optimum = result["gapPlan"], result["optimizedPlan"]
+                    for plan in (greedy, optimum):
+                        self.assertGreaterEqual(plan["netBenefit"], -NET_BENEFIT_TOLERANCE)
+                        self.assertLessEqual(plan["spend"], limits["budget"])
+                        self.assertLessEqual(plan["crewHours"], limits["crewHours"])
+                        self.assertLessEqual(plan["inverterKits"], limits["inverterSpares"])
+                        self.assertEqual(len({a["sectionId"] for a in plan["actions"]}), len(plan["actions"]))
+                    self.assertGreaterEqual(optimum["netBenefit"] + NET_BENEFIT_TOLERANCE, greedy["netBenefit"])
+                    for decision in greedy["decisions"]:
+                        if decision["accepted"]:
+                            self.assertGreater(decision["marginalNetBenefit"], NET_BENEFIT_TOLERANCE)
+                        if decision["marginalNetBenefit"] is not None:
+                            self.assertEqual(decision["accepted"], decision["marginalNetBenefit"] > NET_BENEFIT_TOLERANCE)
 
     def test_optimizer_against_independent_all_subsets_oracle(self):
         dataset = flat_dataset(48, {"B": "snow", "D": "inverter", "E": "soiling", "C": "degradation"}, cap=50)

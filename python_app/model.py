@@ -7,6 +7,9 @@ HOURS = 336
 OBSERVATION_HOURS = 13  # Intervals 00:00-13:00; decisions start at 13:00.
 DEFAULT_DEGRADATION_LOSS_PCT = 6.0
 DEFAULT_SNOW_CLEARANCE_HOURS = 24.0
+NET_BENEFIT_TOLERANCE = 1e-6  # Dollars, not MWh.
+MULTI_FAULT_OPTIONS = dict(budget=64000, crewHours=32, inverterSpares=2,
+                          paymentRate=115, snowClearanceHours=96)
 PLANT = {"name": "Fictional Plant A", "acLimitMw": 60, "sections": [
     {"id": "A", "name": "North Field", "acMw": 8},
     {"id": "B", "name": "Ridge West", "acMw": 14},
@@ -23,11 +26,13 @@ SCENARIOS = [
     {"id": "soiling", "name": "Soiling", "weather": "sunny"},
     {"id": "module-degradation", "name": "Existing module degradation", "weather": "sunny"},
     {"id": "grid-curtailment", "name": "Grid curtailment", "weather": "sunny"},
+    {"id": "multi-fault-demo", "name": "Multi-fault demo: greedy vs better combination", "weather": "mixed-sunny"},
 ]
 # Synthetic ground truth is used only to generate observations and forecast output.
 _CONDITIONS = {"required-demo": {"B": "snow", "D": "inverter"},
                "inverter-fault": {"D": "inverter"}, "snow-coverage": {"B": "snow"},
-               "soiling": {"E": "soiling"}, "module-degradation": {"C": "degradation"}}
+               "soiling": {"E": "soiling"}, "module-degradation": {"C": "degradation"},
+               "multi-fault-demo": {"B": "snow", "A": "inverter", "D": "inverter"}}
 ACTION_DEFS = {
     "inverter": dict(action="Repair inverter", cost=32000, crewHours=16, delayHours=12, spareParts={"inverterKit": 1}, effectiveness=.97, downtimeHours=4, explanation="Restores most output after a 12-hour completion delay; the final four hours are a zero-output repair outage. Requires one inverter kit."),
     "snow": dict(action="Remove snow", cost=9000, crewHours=12, delayHours=6, spareParts={"inverterKit": 0}, effectiveness=.92, downtimeHours=0, explanation="Clears modules after six hours. Natural shedding continues in both the baseline and plan."),
@@ -277,16 +282,50 @@ def optimize(dataset, candidates, constraints, payment_rate):
     return best
 
 
+def profit_screened_gap_first(dataset, candidates, constraints, payment_rate,
+                              tolerance=NET_BENEFIT_TOLERANCE):
+    """Greedy action selection by observed gap, screened on combined-plan value."""
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("Net-benefit tolerance must be finite and nonnegative.")
+    current = simulate_plan(dataset, [], payment_rate)
+    decisions = []
+    ordered = sorted(candidates, key=lambda a: (-a["currentGapMw"], a["sectionId"], a["id"]))
+    for candidate in ordered:
+        proposed_actions = current["actions"] + [candidate]
+        used = resources(proposed_actions)
+        reasons = []
+        if used["spend"] > constraints["budget"]:
+            reasons.append("Combined spending exceeds the maintenance budget.")
+        if used["crewHours"] > constraints["crewHours"]:
+            reasons.append("Combined crew-hours exceed the total allowance.")
+        if used["inverterKits"] > constraints["inverterSpares"]:
+            reasons.append("Combined inverter kit requirements exceed available spares.")
+        if any(a["sectionId"] == candidate["sectionId"] for a in current["actions"]):
+            reasons.append("An action is already selected for this section.")
+        decision = dict(actionId=candidate["id"], sectionId=candidate["sectionId"],
+                        currentGapMw=candidate["currentGapMw"], accepted=False,
+                        currentNetBenefit=current["netBenefit"], proposedNetBenefit=None,
+                        marginalNetBenefit=None, reasons=reasons)
+        if not reasons:
+            proposed = simulate_plan(dataset, proposed_actions, payment_rate)
+            marginal = proposed["netBenefit"] - current["netBenefit"]
+            decision.update(proposedNetBenefit=proposed["netBenefit"], marginalNetBenefit=marginal)
+            if marginal > tolerance:
+                decision["accepted"] = True
+                reasons.append("Combined-plan marginal net benefit exceeds the numerical tolerance.")
+                current = proposed
+            else:
+                reasons.append("Combined-plan marginal net benefit does not exceed the numerical tolerance.")
+        decisions.append(decision)
+    return dict(current, decisions=decisions, netBenefitTolerance=tolerance)
+
+
 def evaluate(dataset, constraints=None, payment_rate=115, candidates=None):
     constraints = dict(constraints or DEFAULT_CONSTRAINTS)
     validate_inputs(dataset["plant"], constraints, payment_rate)
     diagnostics = diagnose(dataset["observations"])
     candidates = build_candidates(diagnostics) if candidates is None else candidates
-    gap_actions = []
-    for candidate in sorted(candidates, key=lambda a: -a["currentGapMw"]):
-        if feasible(gap_actions + [candidate], constraints):
-            gap_actions.append(candidate)
     return dict(dataset=dataset, diagnostics=diagnostics, candidates=candidates, constraints=constraints,
                 paymentRate=payment_rate, noIntervention=simulate_plan(dataset, [], payment_rate),
-                gapPlan=simulate_plan(dataset, gap_actions, payment_rate),
+                gapPlan=profit_screened_gap_first(dataset, candidates, constraints, payment_rate),
                 optimizedPlan=optimize(dataset, candidates, constraints, payment_rate))

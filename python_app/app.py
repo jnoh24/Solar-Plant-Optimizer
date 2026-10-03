@@ -5,7 +5,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from model import PLANT, SCENARIOS, generate_scenario, evaluate, simulate_plan
+from model import PLANT, SCENARIOS, MULTI_FAULT_OPTIONS, generate_scenario, evaluate, simulate_plan
 
 st.set_page_config(page_title="Solar Asset Optimization", layout="wide")
 
@@ -16,8 +16,14 @@ def reset_demo():
     st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
 
 
-def reset_weather():
+def on_scenario_change():
     st.session_state["weather"] = "Scenario default"
+    if st.session_state["scenario"] == "multi-fault-demo":
+        for key, option in (("budget", "budget"), ("crew", "crewHours"), ("spares", "inverterSpares"),
+                            ("payment", "paymentRate"), ("snow_clearance", "snowClearanceHours")):
+            value = MULTI_FAULT_OPTIONS[option]
+            st.session_state[key] = float(value) if key in ("payment", "snow_clearance") else value
+        st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
 
 
 st.title("Explainable Solar Asset Optimization")
@@ -26,22 +32,26 @@ st.caption("Fictional Plant A | 60 MW AC limit | Six unequal array sections | 14
 st.caption("Maintenance action selection, not a dispatch schedule. Total crew-hours are constrained; parallel crew availability is not modeled.")
 st.caption("Portfolio context: approximately 325 MW AC across five Ontario plants. This fictional plant does not imply equal portfolio capacities.")
 
+for key, value in dict(degradation=6.0, snow_clearance=24.0, budget=45000,
+                       crew=22, spares=1, payment=115.0).items():
+    st.session_state.setdefault(key, value)
+
 with st.sidebar:
     st.header("Scenario inputs")
     scenario_id = st.selectbox("Scenario", [s["id"] for s in SCENARIOS],
                                format_func=lambda value: next(s["name"] for s in SCENARIOS if s["id"] == value),
-                               key="scenario", on_change=reset_weather)
+                               key="scenario", on_change=on_scenario_change)
     weather = st.selectbox("Forecast weather profile", ["Scenario default", "mixed-sunny", "sunny", "cloudy"], key="weather")
     degradation = st.number_input("Existing degradation output loss (%)", min_value=0.0, max_value=100.0,
-                                  value=6.0, step=1.0, key="degradation")
+                                  value="min", step=1.0, key="degradation")
     st.caption("Constant loss in the degradation scenario. This is existing degradation, not annual aging.")
     snow_clearance = st.number_input("Assumed natural snow clearance (hours after decision)",
-                                     min_value=0.0, value=24.0, step=1.0, key="snow_clearance")
+                                     min_value=0.0, value="min", step=1.0, key="snow_clearance")
     st.caption("User assumption, not a weather prediction. Zero means immediate clearance; values above 336 extend beyond the forecast.")
-    budget = st.number_input("Maintenance budget ($)", min_value=0, value=45000, step=1000, key="budget")
-    crew = st.number_input("Total available crew-hours", min_value=0, value=22, step=1, key="crew")
-    spares = st.number_input("Available inverter spare kits", min_value=0, value=1, step=1, key="spares")
-    payment = st.number_input("Assumed payment ($/MWh)", min_value=0.0, value=115.0, step=1.0, key="payment")
+    budget = st.number_input("Maintenance budget ($)", min_value=0, value="min", step=1000, key="budget")
+    crew = st.number_input("Total available crew-hours", min_value=0, value="min", step=1, key="crew")
+    spares = st.number_input("Available inverter spare kits", min_value=0, value="min", step=1, key="spares")
+    payment = st.number_input("Assumed payment ($/MWh)", min_value=0.0, value="min", step=1.0, key="payment")
     st.caption("Payment is an explicit assumption, not a verified PPA tariff. All dollar amounts use the same assumed currency.")
     st.button("Reset demo", on_click=reset_demo, width="stretch")
 
@@ -57,7 +67,8 @@ plant["sections"] = sections.to_dict("records")
 constraints = dict(budget=budget, crewHours=crew, inverterSpares=spares)
 inputs = dict(scenario=scenario_id, weather=weather, plant=plant, constraints=constraints, payment=payment,
               degradation=degradation, snow_clearance=snow_clearance)
-if "result" in st.session_state and "observations" not in st.session_state["result"]["dataset"]:
+if "result" in st.session_state and ("observations" not in st.session_state["result"]["dataset"]
+                                     or "decisions" not in st.session_state["result"]["gapPlan"]):
     st.session_state.pop("result")
     st.session_state.pop("inputs", None)
 run = st.button("Run optimization", type="primary")
@@ -85,6 +96,10 @@ st.caption("Decision time: day 1, 13:00. Historical observations cover 00:00-13:
 st.caption(f'Results use {dataset["scenario"]["weather"]} weather; budget ${limits["budget"]:,.0f}, '
            f'{limits["crewHours"]} crew-hours, {limits["inverterSpares"]} spare kits, '
            f'${result["paymentRate"]:,.2f}/MWh.')
+if dataset["scenario"]["id"] == "multi-fault-demo":
+    st.caption("Multi-fault demonstration: snow on B, inverter alarms on A and D. "
+               "The preset uses $64,000, 32 total crew-hours, two spare kits, $115/MWh, and assumed snow clearance at 96 hours. "
+               "Greedy selection can spend resources on profitable snow removal before considering both repairs.")
 cols = st.columns(4)
 cols[0].metric("Baseline energy", f'{baseline["baselineMwh"]:,.1f} MWh')
 cols[1].metric("Additional energy", f'{optimized["recoveredMwh"]:,.1f} MWh')
@@ -121,16 +136,35 @@ comparison = pd.DataFrame([{"Strategy": label, "Total energy (MWh)": plan["planM
                             "Additional energy (MWh)": plan["recoveredMwh"], "Spending ($)": plan["spend"],
                             "Net benefit ($)": plan["netBenefit"], "Crew-hours": plan["crewHours"],
                             "Spare kits": plan["inverterKits"]}
-                           for label, plan in [("No intervention", baseline), ("Largest gap first", gap),
+                           for label, plan in [("No intervention", baseline), ("Profit-screened largest-gap-first", gap),
                                                ("Financially optimized", optimized)]])
 st.altair_chart(alt.Chart(comparison).mark_bar().encode(
-    x=alt.X("Strategy:N", sort=comparison["Strategy"].tolist(), axis=alt.Axis(labelAngle=0)),
-    y="Net benefit ($):Q", color=alt.Color("Strategy:N", legend=None),
+    y=alt.Y("Strategy:N", sort=comparison["Strategy"].tolist(), axis=alt.Axis(labelLimit=310)),
+    x="Net benefit ($):Q", color=alt.Color("Strategy:N", legend=None),
     tooltip=["Strategy:N", alt.Tooltip("Net benefit ($):Q", format=",.2f")]
 ).properties(height=240), width="stretch")
 st.dataframe(comparison, hide_index=True, width="stretch",
              column_config={key: st.column_config.NumberColumn(format="%.1f") for key in
                             ["Total energy (MWh)", "Additional energy (MWh)", "Net benefit ($)"]})
+
+st.subheader("Profit-screened baseline decisions")
+st.caption(f'Candidates are checked by descending latest observed gap, then section ID and action ID. '
+           f'Acceptance requires marginal combined-plan net benefit greater than ${gap["netBenefitTolerance"]:g}. '
+           'Resource failures are skipped before valuation; shared export caps are included in each simulated plan.')
+action_names = {a["id"]: a["action"] for a in result["candidates"]}
+if gap["decisions"]:
+    decisions = pd.DataFrame([{
+        "Order": index + 1, "Action": f'{decision["sectionId"]} | {action_names[decision["actionId"]]}',
+        "Observed gap (MW)": decision["currentGapMw"],
+        "Decision": "Accepted" if decision["accepted"] else "Skipped",
+        "Marginal net benefit ($)": decision["marginalNetBenefit"],
+        "Explanation": " ".join(decision["reasons"])
+    } for index, decision in enumerate(gap["decisions"])])
+    st.dataframe(decisions, hide_index=True, width="stretch", column_config={
+        "Observed gap (MW)": st.column_config.NumberColumn(format="%.2f"),
+        "Marginal net benefit ($)": st.column_config.NumberColumn(format="%.6f")})
+else:
+    st.write("No candidate actions; the baseline retains no intervention.")
 
 left, right = st.columns(2)
 with left:
@@ -175,9 +209,9 @@ with right:
                 reasons.append("Inspection is available for information gathering; its information value is not quantified.")
             st.write(" ".join(reasons) or "Other actions create greater total value within the shared resource limits.")
         if action["id"] in gap_ids and not chosen:
-            st.write("Largest-gap-first selects this action based on its current MW gap.")
+            st.write("Profit-screened largest-gap-first accepts this action; its marginal gain is positive, but a different combination creates greater value.")
         elif chosen and action["id"] not in gap_ids:
-            st.write("Financial optimization selects this for its future value; largest-gap-first does not.")
+            st.write("Financial optimization selects this for its future value; profit-screened largest-gap-first skips it.")
         st.divider()
 
 with st.expander("Assumptions and calculations", expanded=True):
@@ -199,6 +233,13 @@ with st.expander("Assumptions and calculations", expanded=True):
              "Zero clearance hours means fully clear immediately. Clearance beyond 336 hours leaves snow at the end. "
              "The same curve applies to every plan; removal raises the factor to at least 92% after completion "
              "and earns credit only before natural clearance. Clearance time is a user assumption, not predicted from weather.")
+    st.write("Profit-screened largest-gap-first starts with no actions, ranks by latest observed MW gap "
+             "(ties by section ID, then action ID), and checks the same resource and one-action-per-section limits. "
+             "It simulates each feasible addition and accepts only a marginal combined-plan net benefit above $0.000001. "
+             "Standalone profitability is not sufficient: shared export caps can reduce marginal value. "
+             "Skipped actions do not prevent later candidates from being checked; earlier choices are not revisited.")
+    st.write("Both strategies select discretionary actions. Mandatory safety or compliance actions would need "
+             "separate requirements and must not be rejected solely on profitability; they are not modeled here.")
     st.write("Existing degradation is a constant user-entered percentage loss across the forecast, not an hourly "
              "decline or annual aging rate. Inspection has zero immediate energy recovery. Its information value "
              "is not quantified; the energy-only financial objective will not recommend a paid inspection. "
@@ -210,4 +251,4 @@ with st.expander("Assumptions and calculations", expanded=True):
              "Diagnosis sees only records before day 1 at 13:00. Forecast weather and condition assumptions "
              "are used only to value future actions, never to establish a historical diagnosis.")
     st.caption(f'Optimized potential recovery excluded by grid caps: {optimized["excludedCurtailmentMwh"]:.1f} MWh; '
-               f'largest-gap-first: {gap["excludedCurtailmentMwh"]:.1f} MWh.')
+               f'profit-screened largest-gap-first: {gap["excludedCurtailmentMwh"]:.1f} MWh.')

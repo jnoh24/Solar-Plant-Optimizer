@@ -122,16 +122,75 @@ delays are assumed independently; parallel crew availability, shifts, travel
 sequencing, and scheduling are not modeled. Total crew-hours are only a shared
 resource allowance.
 
-Largest-gap-first remains unchanged: sort by the latest observed MW gap and
-select each action if it fits remaining resources, without screening its
-profitability. Both intervention strategies use identical constraints. The
-default demo still selects snow removal with gap-first and inverter repair
-with financial optimization. The latter creates greater future value.
+The comparison is now **Profit-screened largest-gap-first**:
+
+1. Start with no selected actions and zero incremental net benefit.
+2. Sort by descending latest observed MW gap; break ties by section ID, then
+   action ID, in ascending order.
+3. Check the proposed combined plan against budget, total crew-hours, spare
+   kits, and the one-action-per-section rule. Skip infeasible additions.
+4. Simulate the combined plan using the same hourly model as the optimizer.
+5. Accept the action only if combined-plan net benefit increases by more than
+   **$0.000001**. Otherwise skip it and continue to the next candidate.
+
+The screen uses **marginal** benefit relative to the plan already selected,
+not standalone profitability. Shared export caps can make a profitable action
+unprofitable as an addition. Earlier greedy choices are not reconsidered, so
+this strategy can still miss a better combination. The dashboard records each
+accept/skip decision, its marginal value when simulated, and resource failures.
+Both active strategies use identical constraints and can choose no intervention.
+Neither selects a plan worse than no intervention; exhaustive search remains
+unchanged and achieves at least the greedy plan's value within tolerance.
+
+In the original snow-versus-inverter demo, the new baseline skips unprofitable
+snow removal, continues to check the inverter, and matches the optimized repair.
+
+These strategies select discretionary actions only. Mandatory safety or
+compliance actions would require separate requirements and **must not be rejected
+solely on profitability**. No such mandatory actions are modeled here.
 
 Whole-plant generation is recalculated for each combination before applying
 export caps. Individual action benefits are not summed, avoiding shared-cap
 double-counting. Signed hourly differences account for repair losses. A zero
 export cap remains zero. Curtailment alone earns no maintenance benefit.
+
+## Multi-Fault Demonstration
+
+Choose **Multi-fault demo: greedy vs better combination**, then click
+**Run optimization**. Choosing this scenario restores the original section
+capacities and loads these explicit input assumptions:
+
+| Input | Value |
+| --- | --- |
+| Faults | Snow on B; inverter faults on A and D |
+| Weather | Mixed-sunny, fixed seed for this scenario |
+| Natural snow clearance | 96 hours after decision |
+| Maintenance budget | $64,000 |
+| Total crew-hours | 32 |
+| Inverter spare kits | 2 |
+| Assumed payment | $115/MWh |
+
+Existing physical/loss models, repair costs, delays, and effectiveness are
+unchanged. You can edit the preset inputs; the result may then differ.
+
+| Strategy | Selected actions | Additional MWh | Spending | Incremental net benefit |
+| --- | --- | ---: | ---: | ---: |
+| No intervention | None | 0 | $0 | $0 |
+| Profit-screened largest-gap-first | B snow removal + D repair | 853.119 | $41,000 | $57,108.63 |
+| Financially optimized | A repair + D repair | 1,262.037 | $64,000 | $81,134.29 |
+
+Snow has the largest observed gap. Its $2,028.06 standalone net benefit is
+positive under the slower-clearance assumption, so greedy selection accepts
+it, followed by the profitable D repair. Adding A would exceed both budget and
+crew limits. Exhaustive search instead finds both repairs feasible and worth
+$24,025.66 more. It is not modified to obtain this result.
+
+Tests independently integrate healthy forecast MW using the documented snow
+curve and repair recovery/outage factors, then score all feasible subsets with
+simple cost/crew/spare arithmetic. They do not use the simulation function to
+calculate expected demo values. A separate flat-output, 45 MW export-cap test
+checks that a profitable standalone repair is skipped when the first selected
+repair already fills the shared cap.
 
 ## Verification and History
 
@@ -144,9 +203,11 @@ python3 verify.py
 They cover constant degradation, zero inspection recovery, immediate/late snow
 clearance, historical-only diagnosis, forecast-information leakage, budgets,
 crew-hours, spares, repair downtime, MW/MWh units, AC/export caps, and duplicate
-actions. A separate hand-calculated all-subsets oracle verifies the highest
-net-benefit feasible combination, including doing nothing. The gap-first rule
-is also checked without changing it. Streamlit controls can be checked after
+actions. Separate hand-calculated all-subsets oracles verify the highest
+net-benefit feasible combination, including doing nothing. New tests check
+marginal profit screening, ties, numerical tolerance, continued checking after
+skips, shared export caps, and both strategies' resource/value invariants across
+160 scenario/clearance/resource combinations. Streamlit controls can be checked after
 installing requirements:
 
 ```bash
@@ -168,5 +229,8 @@ on its Git branch is untouched.
 
 The pre-update working Python version is preserved by local Git tag
 `pre-model-assumptions-20261003` at commit `970714f`. The tag has not been pushed.
+The corrected working version immediately before this strategy update is
+committed at `4c9e7c3`, with local tag `pre-profit-screened-20261003`.
+Neither backup tag nor the new backup commit was pushed by this update.
 See `verification_results.txt` for current verification results and
 `historical_conversion/verification_results.txt` for the earlier conversion.

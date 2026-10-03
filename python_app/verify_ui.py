@@ -11,6 +11,33 @@ from model import SCENARIOS
 
 
 class InterfaceVerification(unittest.TestCase):
+    def test_multi_fault_preset_strategy_labels_and_decisions(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=20).run()
+        app.selectbox(key="scenario").set_value("multi-fault-demo").run()
+        for key, expected in (("budget", 64000), ("crew", 32), ("spares", 2),
+                              ("payment", 115), ("snow_clearance", 96)):
+            self.assertEqual(app.number_input(key=key).value, expected)
+        next(button for button in app.button if button.label == "Run optimization").click().run()
+        result = app.session_state["result"]
+        self.assertEqual([a["id"] for a in result["gapPlan"]["actions"]], ["B-snow", "D-inverter"])
+        self.assertEqual([a["id"] for a in result["optimizedPlan"]["actions"]], ["A-inverter", "D-inverter"])
+        self.assertGreater(result["optimizedPlan"]["netBenefit"], result["gapPlan"]["netBenefit"])
+        table = next(frame.value for frame in app.dataframe if "Strategy" in frame.value.columns)
+        self.assertEqual(table["Strategy"].tolist(), ["No intervention", "Profit-screened largest-gap-first", "Financially optimized"])
+        trace = next(frame.value for frame in app.dataframe if "Decision" in frame.value.columns)
+        self.assertEqual(trace["Decision"].tolist(), ["Accepted", "Accepted", "Skipped"])
+        self.assertIn("crew-hours", trace.iloc[2]["Explanation"])
+        self.assertEqual(len(app.exception), 0)
+        prior_strategy = deepcopy(result)
+        prior_strategy["gapPlan"].pop("decisions")
+        app.session_state["result"] = prior_strategy
+        app.run()
+        self.assertIn("decisions", app.session_state["result"]["gapPlan"])
+        self.assertEqual(len(app.exception), 0)
+        next(button for button in app.button if button.label == "Reset demo").click().run()
+        self.assertEqual(app.number_input(key="budget").value, 45000)
+        self.assertEqual(app.number_input(key="snow_clearance").value, 24)
+
     def test_dashboard_without_legacy_data(self):
         original_open = Path.open
 
@@ -30,7 +57,8 @@ class InterfaceVerification(unittest.TestCase):
         next(button for button in app.button if button.label == "Run optimization").click().run()
         result = app.session_state["result"]
         self.assertEqual(result["dataset"]["observations"], observations)
-        self.assertEqual(result["gapPlan"]["recoveredMwh"], 0)
+        self.assertEqual([a["id"] for a in result["gapPlan"]["actions"]], ["D-inverter"])
+        self.assertFalse(result["gapPlan"]["decisions"][0]["accepted"])
         app.number_input(key="snow_clearance").set_value(672.0).run()
         next(button for button in app.button if button.label == "Run optimization").click().run()
         self.assertEqual(app.session_state["result"]["dataset"]["assumptions"]["snowClearanceHours"], 672)

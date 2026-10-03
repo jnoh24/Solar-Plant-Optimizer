@@ -1,7 +1,7 @@
-Current Python model verification (2026-10-03)
+Current Python strategy verification (2026-10-03)
 
-PASS: python3 verify.py -- 10 independent model correctness tests.
-PASS: .venv/bin/python verify_ui.py -- 3 Streamlit AppTest checks.
+PASS: python3 verify.py -- 14 independent model correctness tests.
+PASS: .venv/bin/python verify_ui.py -- 4 Streamlit AppTest checks.
 PASS: python3 historical_conversion/verify_conversion.py -- 7 archived tests,
       including 35 stored shared-data conversion evaluations. Historical only.
 PASS: git diff --check.
@@ -14,18 +14,35 @@ establish causes; budget, total crew-hours, spares; signed repair outage losses;
 section/plant/export caps (including zero); MW/MWh units; duplicate rejection;
 shared-cap double-counting; highest-value feasible subset including no action.
 
-UI checks cover all scenarios, weather, section edits, new assumption inputs,
-stale results before Run, Reset demo, old-session refresh, and startup guarded
-against reading legacy reference/JavaScript files.
+New checks cover 160 scenario/clearance/resource combinations; identical active
+strategy constraints; positive marginal acceptance only; deterministic ties;
+one-action-per-section; tolerance; continued checking after skips; neither
+strategy worse than no action; optimum at least as valuable as greedy selection.
+Shared-cap fixture: 48 hours, faults B/D, 45 MW export cap. D standalone net
+benefit is $7,882, but marginal benefit after selecting B is -$32,276, so D is
+skipped. Calculated independently from 9.7 MW export headroom and outage loss.
+
+UI checks cover all scenarios, weather, section edits, assumption inputs,
+stale results before Run, Reset demo, prior-session refresh, multi-fault preset,
+strategy labels, acceptance/skip explanations, and startup guarded against
+reading legacy reference/JavaScript files.
 
 Current required demo (14 days AFTER the day-1 13:00 decision):
 No intervention: 0 incremental MWh, $0 incremental net benefit.
-Largest-gap-first: B-snow; 1.390423 incremental MWh; $9,000 cost;
-                  -$8,840.10 incremental net benefit.
+Profit-screened largest-gap-first: D-inverter; 759.018823 incremental MWh;
+                                  $32,000 cost; $55,287.16 incremental net benefit.
 Optimized: D-inverter; 759.018823 incremental MWh; $32,000 cost;
            $55,287.16 incremental net benefit.
 
+Multi-fault demo: snow B, inverter faults A/D, mixed-sunny weather, 96-hour
+clearance, $64,000 budget, 32 crew-hours, 2 kits, $115/MWh.
+Greedy: B-snow + D-inverter; 853.118517 MWh; $41,000 cost; $57,108.63 net.
+Optimized: A-inverter + D-inverter; 1262.037271 MWh; $64,000 cost; $81,134.29 net.
+Improvement: $24,025.66. Independent hourly integration and all-subset scoring
+verify the values and selected plans, including the no-action option.
+
+The exhaustive optimizer and existing simulation function bodies are unchanged.
 The reference.json fixture and JavaScript files were not changed or regenerated.
-Baseline Git snapshot: tag pre-model-assumptions-20261003 at 970714f (local).
+Baseline Git snapshot: tag pre-profit-screened-20261003 at 4c9e7c3 (local).
 All requested model and available Streamlit checks ran. Browser screenshot
 verification was not performed; interface checks use Streamlit's AppTest.
